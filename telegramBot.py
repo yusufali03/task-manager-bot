@@ -4,7 +4,6 @@ import sqlite3
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, BotCommand
-from aiogram.types import CallbackQuery
 
 
 from aiogram.fsm.context import FSMContext
@@ -13,9 +12,16 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram import F, Router
 
-from Database import add_user, get_user_id, init_database
+from Database import add_user, get_user_id, init_database, DB_FILE, get_all_usernames
+from reminder import scheduler, send_reminder
 
 callback_router = Router()
+
+from aiogram.types import CallbackQuery
+from aiogram_calendar.simple_calendar import SimpleCalendar, SimpleCalendarCallback
+calendar = SimpleCalendar()
+
+
 
 
 class NewTask(StatesGroup):
@@ -29,36 +35,6 @@ class NewTask(StatesGroup):
 
 TOKEN = "8125138623:AAGVv6Dl_nNx222okT1W0DsoQDHW4UwPR5c"
 
-DB_FILE = "tasks.db"
-# Connect to SQLite database
-db = sqlite3.connect(DB_FILE)
-cursor = db.cursor()
-
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT UNIQUE
-    )
-''')
-
-
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        topic TEXT NOT NULL,
-        description TEXT NOT NULL,
-        sender TEXT NOT NULL,
-        recipient INTEGER NOT NULL,
-        due_date TEXT NOT NULL,
-        importance TEXT CHECK (importance IN ('Low', 'Average', 'High')),
-        status TEXT CHECK (status IN ('New', 'Accepted', 'Completed')) DEFAULT 'New'
-    )
-''')
-
-db.commit()
-db.close()
-
-
 # Initialize bot and dispatcher
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -71,6 +47,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="new_task", description="Create a task"),
         BotCommand(command="my_tasks", description="List of sent tasks"),
         BotCommand(command="tasks_for_me", description="List of received tasks"),
+        BotCommand(command="stats", description="List of statistics"),
     ]
     await bot.set_my_commands(commands)
 
@@ -90,7 +67,17 @@ async def start_command(message: Message):
 # New Task command
 @dp.message(Command("new_task"))
 async def new_task_command(message: Message, state: FSMContext):
-    await message.answer("Enter the task **Topic**:")
+    users = get_all_usernames()
+
+    if not users:
+        await message.answer("⚠️ No users found in the system.")
+        return
+
+    user_list = "\n".join([f"`@{user}`" for user in users])
+
+    await message.answer(
+        f"📌 **Available Users:**\n{user_list}\n\n"
+        "Enter the task **Topic**:")
     await state.set_state(NewTask.topic)
 
 @dp.message(NewTask.topic)
@@ -108,22 +95,31 @@ async def process_description(message: Message, state: FSMContext):
 
 @dp.message(NewTask.recipient)
 async def process_recipient(message: Message, state: FSMContext):
-    recipient_username = message.text.strip()
-
-    # Remove '@' if user entered it
-    if recipient_username.startswith("@"):
-        recipient_username = recipient_username[1:]
-
-    # Fetch user ID from database (if already stored)
+    recipient_username = message.text.strip().lstrip("@")
     recipient_id = get_user_id(recipient_username)
 
     if recipient_id is None:
-        await message.answer("❌ Error: I cannot find this user. The recipient must first **start the bot**.")
+        await message.answer("❌ The recipient **has not started the bot yet**. They need to send `/start` first.")
         return
 
     await state.update_data(recipient_id=recipient_id, recipient_username=recipient_username)
-    await message.answer("Enter the **Deadline** (YYYY-MM-DD):")
-    await state.set_state(NewTask.deadline)
+
+    await message.answer("📅 **Choose a deadline date:**", reply_markup=await SimpleCalendar().start_calendar())
+
+@dp.callback_query(SimpleCalendarCallback.filter())
+async def process_calendar_selection(callback_query: CallbackQuery, callback_data: dict, state: FSMContext):
+    selected, date = await SimpleCalendar().process_selection(callback_query, callback_data)
+
+    if selected:
+        formatted_date = date.strftime("%Y-%m-%d")  # Convert to YYYY-MM-DD format
+
+        # ✅ Store selected date in FSM
+        await state.update_data(deadline=formatted_date)
+
+        await callback_query.message.answer(f"📌 **Deadline Selected:** {formatted_date}\nNow enter the **importance (Low, Average, High)**:")
+        await state.set_state(NewTask.importance)
+
+
 
 
 @dp.message(NewTask.deadline)
@@ -184,12 +180,13 @@ async def process_importance(message: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("accept_task_"))
 async def accept_task_callback(callback_query: CallbackQuery):
     task_id = callback_query.data.split("_")[2]
+    recipient_id = callback_query.from_user.id  # ✅ Get recipient ID
     recipient_username = callback_query.from_user.username if callback_query.from_user.username else callback_query.from_user.full_name
 
     db = sqlite3.connect(DB_FILE)
     cursor = db.cursor()
 
-    cursor.execute("SELECT sender FROM tasks WHERE id = ?", (task_id,))
+    cursor.execute("SELECT sender, topic, description, due_date, importance FROM tasks WHERE id = ?", (task_id,))
     task = cursor.fetchone()
 
     if not task:
@@ -197,46 +194,59 @@ async def accept_task_callback(callback_query: CallbackQuery):
         db.close()
         return
 
-    sender_username = task[0]  # Extract sender username
+    sender_username, topic, description, deadline, importance = task
 
     cursor.execute("SELECT user_id FROM users WHERE username = ?", (sender_username,))
     sender = cursor.fetchone()
+    sender_id = sender[0] if sender else None  # Extract sender ID or set to None
 
-    if sender:
-        sender_id = sender[0]  # Extract stored user ID
-    else:
-        sender_id = None  # Sender hasn't started the bot
-
+    # ✅ Update task status to "Accepted"
     cursor.execute("UPDATE tasks SET status = 'Accepted' WHERE id = ?", (task_id,))
     db.commit()
     db.close()
 
+    # ✅ Keep the task message but replace buttons with "End Task" button
+    new_text = (f"📢 **New Task Assigned!**\n\n"
+                f"📝 **Topic:** {topic}\n"
+                f"📄 **Description:** {description}\n"
+                f"📅 **Deadline:** {deadline}\n"
+                f"⚡ **Importance:** {importance}\n"
+                f"📌 **Assigned by:** @{sender_username}\n\n"
+                f"✅ **Task Accepted** by @{recipient_username}!")
+
+    # ✅ Show only "End Task" button after accepting
     end_task_button = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ End Task", callback_data=f"complete_task_{task_id}")]
     ])
 
-    await callback_query.message.edit_text(f"✅ Task **{task_id}** has been **accepted** by @{recipient_username}!\n"
-                                           f"Click below when the task is complete:", reply_markup=end_task_button)
+    await callback_query.message.edit_text(new_text, reply_markup=end_task_button)  # ✅ Keep message + End Task button
 
+    # ✅ Notify the sender (delete message after 5 sec)
     if sender_id:
         try:
-            await bot.send_message(sender_id, f"📢 **Task Accepted!**\n\n"
-                                              f"Your task **{task_id}** has been accepted by **@{recipient_username}**.")
+            sent_message = await bot.send_message(sender_id, f"📢 **Task Accepted!**\n\n"
+                                                             f"Your task **{task_id}** has been accepted by **@{recipient_username}**.")
+            await asyncio.sleep(5)
+            await bot.delete_message(sender_id, sent_message.message_id)
         except Exception as e:
             print(f"⚠️ Could not send message to sender: {e}")
 
     await callback_query.answer("Task Accepted ✅")
 
 
+
+
 @dp.callback_query(F.data.startswith("complete_task_"))
 async def complete_task_callback(callback_query: CallbackQuery):
     task_id = callback_query.data.split("_")[2]
+    recipient_id = callback_query.from_user.id  # ✅ Get recipient ID
     recipient_username = callback_query.from_user.username if callback_query.from_user.username else callback_query.from_user.full_name
 
     db = sqlite3.connect(DB_FILE)
     cursor = db.cursor()
 
-    cursor.execute("SELECT sender FROM tasks WHERE id = ?", (task_id,))
+    # ✅ Get task details
+    cursor.execute("SELECT sender, topic, description, due_date, importance FROM tasks WHERE id = ?", (task_id,))
     task = cursor.fetchone()
 
     if not task:
@@ -244,68 +254,80 @@ async def complete_task_callback(callback_query: CallbackQuery):
         db.close()
         return
 
-    sender_username = task[0]  # Extract sender username
+    sender_username, topic, description, deadline, importance = task
 
+    # ✅ Get sender's Telegram ID
     cursor.execute("SELECT user_id FROM users WHERE username = ?", (sender_username,))
     sender = cursor.fetchone()
+    sender_id = sender[0] if sender else None  # Extract sender ID or set to None
 
-    if sender:
-        sender_id = sender[0]  # Extract stored user ID
-    else:
-        sender_id = None  # Sender hasn't started the bot
-
+    # ✅ Update task status to "Completed"
     cursor.execute("UPDATE tasks SET status = 'Completed' WHERE id = ?", (task_id,))
     db.commit()
     db.close()
 
+    # ✅ Keep task message but remove buttons
+    new_text = (f"📢 **New Task Assigned!**\n\n"
+                f"📝 **Topic:** {topic}\n"
+                f"📄 **Description:** {description}\n"
+                f"📅 **Deadline:** {deadline}\n"
+                f"⚡ **Importance:** {importance}\n"
+                f"📌 **Assigned by:** @{sender_username}\n\n"
+                f"✅ **Task Completed** by @{recipient_username}! 🎉")
 
-    await callback_query.message.edit_text(f"🎉 Task **{task_id}** has been **marked as completed** by @{recipient_username}!")
+    await callback_query.message.edit_text(new_text)  # ✅ Keep message but remove buttons
 
+    # ✅ Notify the sender (delete message after 5 sec)
     if sender_id:
         try:
-            await bot.send_message(sender_id, f"🎉 **Task Completed!**\n\n"
-                                              f"Your task **{task_id}** has been marked as **completed** by **@{recipient_username}**.")
+            sent_message = await bot.send_message(sender_id, f"🎉 **Task Completed!**\n\n"
+                                                             f"Your task **{task_id}** has been marked as **completed** by **@{recipient_username}**.")
+            await asyncio.sleep(5)
+            await bot.delete_message(sender_id, sent_message.message_id)
         except Exception as e:
             print(f"⚠️ Could not send message to sender: {e}")
 
     await callback_query.answer("Task Completed ✅")
 
-
-
 @dp.message(Command("my_tasks"))
 async def my_tasks_command(message: Message):
+    print("DEBUG: /my_tasks command triggered")  # ✅ Debugging line
+
     sender = message.from_user.username if message.from_user.username else message.from_user.full_name
 
     db = sqlite3.connect(DB_FILE)
     cursor = db.cursor()
-    cursor.execute("SELECT id, topic, due_date, importance, status FROM tasks WHERE sender = ?", (sender,))
+    cursor.execute("SELECT id, topic, recipient, due_date, importance, status FROM tasks WHERE sender = ?", (sender,))
     tasks = cursor.fetchall()
     db.close()
 
     if not tasks:
-        await message.answer("📌 **You haven't assigned any tasks yet.**")
+        await message.answer("📌 **No tasks have been sent by you.**")
         return
 
     response = "📌 **Your Sent Tasks:**\n\n"
     for task in tasks:
         response += f"🆔 **Task ID:** {task[0]}\n" \
                     f"📌 **Topic:** {task[1]}\n" \
-                    f"📅 **Deadline:** {task[2]}\n" \
-                    f"⚡ **Importance:** {task[3]}\n" \
-                    f"📌 **Status:** `{task[4]}`\n\n"
+                    f"📌 **Recipient:** @{task[2]}\n" \
+                    f"📅 **Deadline:** {task[3]}\n" \
+                    f"⚡ **Importance:** {task[4]}\n" \
+                    f"📌 **Status:** `{task[5]}`\n\n"
 
     await message.answer(response, parse_mode="Markdown")
 
 
 @dp.message(Command("tasks_for_me"))
 async def tasks_for_me_command(message: Message):
-    recipient = message.from_user.username if message.from_user.username else message.from_user.full_name
+    recipient = str(message.from_user.id)  # ✅ FIX: Use Telegram user ID instead of username
+
 
     db = sqlite3.connect(DB_FILE)
     cursor = db.cursor()
     cursor.execute("SELECT id, topic, sender, due_date, importance, status FROM tasks WHERE recipient = ?", (recipient,))
     tasks = cursor.fetchall()
     db.close()
+
 
     if not tasks:
         await message.answer("📌 **No tasks have been assigned to you.**")
@@ -323,12 +345,97 @@ async def tasks_for_me_command(message: Message):
     await message.answer(response, parse_mode="Markdown")
 
 
+
+
+
+
+import calendar
+@dp.message(Command("stats"))
+async def stats_command(message: Message):
+    user_id = message.from_user.id
+
+    db = sqlite3.connect(DB_FILE)
+    cursor = db.cursor()
+
+    # ✅ Count "In Progress" tasks
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE recipient = ? AND status = 'Accepted'", (user_id,))
+    in_progress = cursor.fetchone()[0]
+
+    # ✅ Count "Completed" tasks per month
+    cursor.execute("""
+        SELECT COALESCE(substr(due_date, 6, 2), '00') AS month, COUNT(*) 
+        FROM tasks 
+        WHERE recipient = ? AND status = 'Completed' 
+        GROUP BY month 
+        ORDER BY month ASC
+    """, (user_id,))
+    completed_tasks = cursor.fetchall()
+
+    # ✅ Count "Assigned" tasks per month
+    cursor.execute("""
+        SELECT COALESCE(substr(due_date, 6, 2), '00') AS month, COUNT(*) 
+        FROM tasks 
+        WHERE sender = ? 
+        GROUP BY month 
+        ORDER BY month ASC
+    """, (user_id,))
+    assigned_tasks = cursor.fetchall()
+
+    db.close()
+
+
+    # ✅ Format response
+    response = "📊 **Task Statistics:**\n\n"
+    response += f"📌 **In Progress Tasks:** {in_progress}\n\n"
+
+    # ✅ Format Completed Tasks
+    response += "✅ **Completed Tasks Per Month:**\n"
+    if completed_tasks:
+        for month, count in completed_tasks:
+            try:
+                month_int = int(month.lstrip("0")) if month and month not in ["00", None] else 0
+                if 1 <= month_int <= 12:
+                    month_name = calendar.month_name[month_int]  # ✅ FIXED HERE
+                else:
+                    month_name = "Unknown"
+            except (ValueError, TypeError):
+                month_name = "Unknown"
+            print(f"DEBUG: Month={month}, Converted={month_int}, Month Name={month_name}")  # ✅ Debugging
+            response += f"📅 {month_name}: {count}\n"
+    else:
+        response += "No completed tasks yet.\n"
+
+    response += "\n"
+
+    # ✅ Format Assigned Tasks
+    response += "📌 **Assigned Tasks Per Month:**\n"
+    if assigned_tasks:
+        for month, count in assigned_tasks:
+            try:
+                month_int = int(month.lstrip("0")) if month and month not in ["00", None] else 0
+                if 1 <= month_int <= 12:
+                    month_name = calendar.month_name[month_int]  # ✅ FIXED HERE
+                else:
+                    month_name = "Unknown"
+            except (ValueError, TypeError):
+                month_name = "Unknown"
+    else:
+        response += "No assigned tasks yet.\n"
+
+    await message.answer(response)
+
+
 # Run bot
 async def main():
     init_database()
+    scheduler.start()
     await set_bot_commands(bot)
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
+
+
+

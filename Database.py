@@ -47,3 +47,12 @@ def get_user_id(username):
 
     return user[0] if user else None
 
+def get_all_usernames():
+    db = sqlite3.connect(DB_FILE)
+    cursor = db.cursor()
+    cursor.execute("SELECT username FROM users WHERE username IS NOT NULL")
+    users = [row[0] for row in cursor.fetchall()]
+    db.close()
+    return users
+
+
